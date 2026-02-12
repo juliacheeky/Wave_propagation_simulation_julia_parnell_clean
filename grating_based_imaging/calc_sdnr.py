@@ -5,16 +5,27 @@ import os
 from parameter import *
 import xraylib as xrl
 
+"""
+Takes the intensities calculated in wave propagation and 
+adds noise ant different photon levels and looks at the SDNR
+
+In general we want to compare a simulation where there is no tumour present 
+(just a block of soft tissue) to a simulation with different sizes cancer sizes
+"""
+
+# height of the pixel in y direction (currently 60 mu /3)
 hight_of_pixel_in_um = 217
 hight_of_pixel_in_pix = int(hight_of_pixel_in_um*1e-6 / detector_pixel_size)
 
+# I want my sample the be quite thick but I don't want to simulate the whole sample 
+# because it would take forever so I just add some additional absorption at the end
 additional_thickness_cm= 11.95
 mu_bkg_in_1_cm = xrl.CS_Total_CP(mat_bkg, E_in_keV) \
                                  * rho_bkg_in_g_cm3
 
-#print(np.exp(-mu_bkg_in_1_cm * additional_thickness_cm))
-data  = "intensity_tumor_background_60keV_all_sizes_talbot3_large_sizes.csv"
+data  = "intensity_tumor_background_60keV.csv"
 
+#Uncoment this is you want to run only a single size of cancer cell
 """
 d_sph = 40
 col_name = f"{int(round(d_sph))}um"
@@ -22,10 +33,18 @@ col_name = f"{int(round(d_sph))}um"
 I_tumor = pd.read_csv(data)[col_name].to_numpy()
 I_ref = pd.read_csv(data)["I_ref"].to_numpy()
 I_no_tumor = pd.read_csv(data)["I_no_tumor"].to_numpy()
+
+I_tumor = I_tumor * np.exp(-mu_bkg_in_1_cm * additional_thickness_cm)
+I_no_tumor = I_no_tumor * np.exp(-mu_bkg_in_1_cm * additional_thickness_cm)
 """
-#I_tumor = I_tumor * np.exp(-mu_bkg_in_1_cm * additional_thickness_cm)
-#I_no_tumor = I_no_tumor * np.exp(-mu_bkg_in_1_cm * additional_thickness_cm)
-def estimate_phi(Iref, Isamp):
+
+def estimate_phi_lstsq(Iref, Isamp):
+    """
+    Calculates the differential phase image from the intensities through least squares fitting
+    
+    :param Iref: reference intensity with no sample in the beam
+    :param Isamp: Either sample with our without tumour
+    """
     omega = 2 * np.pi / (px_in_um*1e-6 / detector_pixel_size)
     x_walk = np.arange(len(Iref))
     
@@ -62,51 +81,83 @@ def estimate_phi(Iref, Isamp):
 
     return np.array(phi_list)
 
+def estimate_phi_fourier(Iref, Isamp):
+    """
+    Calculates the differential phase and transmission image from the intensities 
+    through fourier transform (and then using the coefficients)
+    
+    :param Iref: reference intensity with no sample in the beam
+    :param Isamp: Either sample with our without tumour
+    """
+    omega = 2 * np.pi / (px_in_um*1e-6 / detector_pixel_size)
+    x_walk = np.arange(len(Iref))
+    
+    centers = []
+    phi_list = []
+    mean_list =[]
+
+    for start in range(0, len(x_walk) - segment_size_in_pix + 1, segment_size_in_pix):
+        #print(f"Processing segment starting at pixel {start}")
+        x_seg = x_walk[start:start+segment_size_in_pix]
+        Iref_seg = Iref[start:start+segment_size_in_pix]
+        Isamp_seg = Isamp[start:start+segment_size_in_pix]
+        fourier_Isamp = np.fft.fft(Isamp_seg)
+        fourier_Iref = np.fft.fft(Iref_seg)
+        N = len(Isamp_seg)
+        k = int(N / (px_in_um*1e-6 / detector_pixel_size))
+
+        mean_samp = fourier_Isamp[0].real / N
+        amp_samp = 2 * np.abs(fourier_Isamp[k]) / N
+        phase_samp = np.angle(fourier_Isamp[k])
+
+        mean_ref = fourier_Iref[0].real / N
+        amp_ref = 2 * np.abs(fourier_Iref[k]) / N
+        phase_ref = np.angle(fourier_Iref[k])
+
+        mean_list.append(mean_samp/mean_ref)
+        centers.append(np.mean(x_seg))
+        phi_list.append(phase_samp - phase_ref)
+
+    return np.array(phi_list), np.array(mean_list)
 
 def compute_intensity_2D_pixels(I_ref, I_tumor, I_no_tumor, d_sph_um):
+    """
+    Calculates an altered intensity for a tumor "cylinder" of equal height and diameter
+    by simply rescaling the 1D intensity
+        
+    """
+    
     d_sph_in_pix = int(d_sph_um*1e-6 / detector_pixel_size)
-    I_ref_2D_pixel = hight_of_pixel_in_pix*I_ref
+
+    I_ref_2D_pixel = I_ref
     print("sphere diameter in pix",d_sph_in_pix)
-    I_tumor_2D_pixel = (hight_of_pixel_in_pix-d_sph_in_pix)*I_ref + d_sph_in_pix*I_tumor
-    I_tumor_2D_pixel = I_tumor_2D_pixel / I_ref_2D_pixel
-    I_no_tumor_2D_pixel = (hight_of_pixel_in_pix-d_sph_in_pix)*I_ref + d_sph_in_pix*I_no_tumor
-    I_no_tumor_2D_pixel = I_no_tumor_2D_pixel / I_ref_2D_pixel
+
+    I_tumor_2D_pixel = (hight_of_pixel_in_pix-d_sph_in_pix)*I_no_tumor + d_sph_in_pix*I_tumor
+    I_tumor_2D_pixel = I_tumor_2D_pixel / hight_of_pixel_in_pix
+
+    I_no_tumor_2D_pixel = I_no_tumor
+
     return I_ref_2D_pixel, I_tumor_2D_pixel, I_no_tumor_2D_pixel
 
-def estimate_phi_fourier(Iref, Isamp):
-        omega = 2 * np.pi / (px_in_um*1e-6 / detector_pixel_size)
-        x_walk = np.arange(len(Iref))
-        
-        centers = []
-        phi_list = []
-        mean_list =[]
-
-        for start in range(0, len(x_walk) - segment_size_in_pix + 1, segment_size_in_pix):
-            #print(f"Processing segment starting at pixel {start}")
-            x_seg = x_walk[start:start+segment_size_in_pix]
-            Iref_seg = Iref[start:start+segment_size_in_pix]
-            Isamp_seg = Isamp[start:start+segment_size_in_pix]
-            fourier_Isamp = np.fft.fft(Isamp_seg)
-            fourier_Iref = np.fft.fft(Iref_seg)
-            N = len(Isamp_seg)
-            k = int(N / (px_in_um*1e-6 / detector_pixel_size))
-
-            mean_samp = fourier_Isamp[0].real / N
-            amp_samp = 2 * np.abs(fourier_Isamp[k]) / N
-            phase_samp = np.angle(fourier_Isamp[k])
-
-            mean_ref = fourier_Iref[0].real / N
-            amp_ref = 2 * np.abs(fourier_Iref[k]) / N
-            phase_ref = np.angle(fourier_Iref[k])
-
-            mean_list.append(mean_samp/mean_ref)
-            centers.append(np.mean(x_seg))
-            phi_list.append(phase_samp - phase_ref)
-
-        return np.array(phi_list), np.array(mean_list)
 
 def compute_phase_shift_lstsq(I_ref, I_tumor, I_no_tumor, num_realizations, photons):
+    """
+    Takes the noiseless, normalised intensities, adds a fixed amount of photons and 
+    adds poisson noise. The differential phase image is extracted with least squares
 
+    Thats done num_realization amount of time
+    
+    Args:
+        I_ref: reference intensity (no sample present)
+        I_tumor: sample intensity with tumor present
+        I_no_tumor: sample intensity with tumor present
+        num_realizations: amount of noise configurations run for fixed amount of photons
+        photons: number of photons per detector pixel
+
+    Returns:
+        phi_tumor_array: array with tumor present of size (num_realisations, amount of segments)
+        phi_no_tumor_array: array with no tumor presnt of size (num_realisations, amount of segments)
+    """
     phi_tumor_results = []
     phi_no_tumor_results = []
 
@@ -114,8 +165,8 @@ def compute_phase_shift_lstsq(I_ref, I_tumor, I_no_tumor, num_realizations, phot
         I_ref_noisy = np.random.poisson(I_ref * photons)
         I_tumor_noisy = np.random.poisson(I_tumor * photons)
         I_no_tumor_noisy = np.random.poisson(I_no_tumor * photons)
-        phi_tumor = estimate_phi(I_ref_noisy, I_tumor_noisy)
-        phi_no_tumor = estimate_phi(I_ref_noisy, I_no_tumor_noisy)
+        phi_tumor = estimate_phi_lstsq(I_ref_noisy, I_tumor_noisy)
+        phi_no_tumor = estimate_phi_lstsq(I_ref_noisy, I_no_tumor_noisy)
         phi_tumor_results.append(phi_tumor)
         phi_no_tumor_results.append(phi_no_tumor)
 
@@ -124,7 +175,24 @@ def compute_phase_shift_lstsq(I_ref, I_tumor, I_no_tumor, num_realizations, phot
     return phi_tumor_array, phi_no_tumor_array
 
 def compute_phase_shift_fourier(I_ref, I_tumor, I_no_tumor, num_realizations, photons):
+    """
+    Takes the noiseless, normalised intensities, adds a fixed amount of photons and 
+    adds poisson noise. The differential phase image and transmission is extracted with Fourier
 
+    Thats done num_realization amount of time
+    
+    Args:
+        I_ref: reference intensity (no sample present)
+        I_tumor: sample intensity with tumor present
+        I_no_tumor: sample intensity with tumor present
+        num_realizations: amount of noise configurations run for fixed amount of photons
+        photons: number of photons per detector pixel
+
+    Returns:
+        phi_tumor_array: array with tumor present of size (num_realisations, amount of segments)
+        phi_no_tumor_array: array with no tumor presnt of size (num_realisations, amount of segments)
+        mean_tumor_array, mean_no_tumor_array: Mean accordingly
+    """
     phi_tumor_results = []
     phi_no_tumor_results = []
     mean_no_tumor_results = []
@@ -152,6 +220,10 @@ def compute_phase_shift_fourier(I_ref, I_tumor, I_no_tumor, num_realizations, ph
     return phi_tumor_array, phi_no_tumor_array, mean_tumor_array, mean_no_tumor_array
 
 def compute_total_phase(phi_tumor,phi_no_tumor):
+    """
+    computes total/ integrated phase from the differential phase images 
+    through cummulative sum
+    """
     phi_tumor = np.asarray(phi_tumor)
     phi_no_tumor = np.asarray(phi_no_tumor)
     # Ensure shape (num_realizations, n_features)
@@ -207,6 +279,10 @@ def compute_sdnr(G0, G1):
     return sdnr
 
 def photons_vs_sdnr(I_ref, I_tumor, I_no_tumor, file_name, d_sphe):
+    """
+    Calculates the SDNR for different noise levels for fixed sphere size and saves them in a file
+
+    """
     sdnr_phi_list = []
     sdnr_total_phi_list = []
     sdnr_mean_list = []
@@ -234,7 +310,7 @@ def photons_vs_sdnr(I_ref, I_tumor, I_no_tumor, file_name, d_sphe):
         # File does NOT exist — create it
         results = pd.DataFrame({
         "photons": photons_list,
-        f"SDNR_{int(round(d_sphe))}um": sdnr_total_phi_list
+        f"SDNR_{int(round(d_sphe))}um": sdnr_phi_list
         })
         results.to_csv(file_name, index=False)
     else:
@@ -242,7 +318,7 @@ def photons_vs_sdnr(I_ref, I_tumor, I_no_tumor, file_name, d_sphe):
         results = pd.read_csv(file_name)
         
         # Add new column (ensure lengths match)
-        results[f"SDNR_{int(round(d_sphe))}um"] = sdnr_total_phi_list
+        results[f"SDNR_{int(round(d_sphe))}um"] = sdnr_phi_list
         
         results.to_csv(file_name, index=False)
 
@@ -254,7 +330,11 @@ def photons_vs_sdnr(I_ref, I_tumor, I_no_tumor, file_name, d_sphe):
 #phi_tumor_array, phi_no_tumor_array = compute_phase_shift_fourier(I_ref_2D_pixel, I_tumor_2D_pixel, I_no_tumor_2D_pixel, num_realizations=500, photons=num_ph)
 #print(phi_tumor_array.shape)
 
-
+"""
+This for loop goes through all the different sphere sizes and calculates the 
+sdnr for different amounts of photons
+"""
+"""
 d_sphss = [40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200]
 for d_sph in d_sphss:
     col_name = f"{int(round(d_sph))}um"
@@ -264,3 +344,4 @@ for d_sph in d_sphss:
     I_tumor = I_tumor * np.exp(-mu_bkg_in_1_cm * additional_thickness_cm)
     I_no_tumor = I_no_tumor * np.exp(-mu_bkg_in_1_cm * additional_thickness_cm)
     photons_list, sdnr_list, sdnr_mean_list= photons_vs_sdnr(I_ref, I_tumor, I_no_tumor, "sdnr_results_60keV_all_sizes_scaled_12cm_2D_pixel_large_samples_217_total_phase_only_phase_v2.csv", d_sph)
+"""
